@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 
-
 class VaeEncoder(nn.Module):
     def __init__(self, input_size: int, latent_size: int, down_channels: int):
         super().__init__()
@@ -70,7 +69,7 @@ class VAE(nn.Module):
 
         kld = 0.5 * (sigma + torch.square(mu) - log_sigma - 1)
 
-        z = mu + torch.randn_like(sigma) * sigma
+        z = mu + torch.randn_like(sigma) * torch.sqrt(sigma)
         x_pred = self._decoder(z)
         return x_pred, kld
 
@@ -78,7 +77,7 @@ class VAE(nn.Module):
         mu, log_sigma = self._encoder(x)
         sigma = torch.exp(log_sigma)
 
-        return mu + torch.randn_like(sigma) * sigma
+        return mu + torch.randn_like(sigma) * torch.sqrt(sigma)
 
     def decode(self, z):
         return self._decoder(z)
@@ -163,10 +162,71 @@ class VAEAge(nn.Module):
 
         kld = 0.5 * (sigma + torch.square(mu) - log_sigma - 1)
 
-        z = mu + torch.randn_like(sigma) * sigma
+        z = mu + torch.randn_like(sigma) * torch.sqrt(sigma)
         x_pred = self._decoder(z)
         age_pred = self._age(z)
         return x_pred, kld, age_pred
+
+    def encode(self, x):
+        mu, log_sigma = self._encoder(x)
+        sigma = torch.exp(log_sigma)
+
+        return mu + torch.randn_like(sigma) * torch.sqrt(sigma)
+
+    def decode(self, z):
+        return self._decoder(z)
+
+    def reg(self):
+        return self._age.reg()
+
+class VAETriplets(nn.Module):
+    def __init__(self, input_size, latent_size=10, down_channels=2, up_channels=2):
+        super().__init__()
+
+        self._encoder = VaeEncoder(input_size, latent_size, down_channels)
+        self._decoder = VaeDecoder(input_size, latent_size, up_channels)
+        self.latent_size = latent_size
+        self.input_size = input_size
+        self._softmax = torch.nn.Softmax(dim = 0)
+        self._relu = torch.nn.ReLU()
+
+    def forward(self, triple):
+        # x_pred = torch.zeros(x.shape)
+        # mu = torch.zeros([x.shape[0], x.shape[1], self.latent_size])
+        # log_sigma = torch.zeros([x.shape[0], x.shape[1], self.latent_size])
+        # sigma = torch.zeros([x.shape[0], x.shape[1], self.latent_size])
+        # kld = torch.zeros([x.shape[1], self.latent_size])
+
+        x, age = triple[:, :, :-1], triple[:, :, -1]
+
+        ge_differential = self._relu((age[0] - age[1]) ** 2 - (age[1] - age[2]) ** 2).bool()
+
+        mu_sigma = [self._encoder(xi) for i, xi in enumerate(x)]
+        # print(self._encoder(xi)[0].shape, self._encoder(xi)[1].shape, xi.shape, mu[i].shape, log_sigma[i].shape)
+        mu = torch.stack(tuple([x[0] for x in mu_sigma]))
+        log_sigma = torch.stack(tuple([x[1] for x in mu_sigma]))
+        sigma = torch.exp(log_sigma)
+        kld = torch.sum(0.5 * (sigma + torch.square(mu) - log_sigma - 1), dim = 0)
+        x_pred = torch.stack(tuple([self._decoder(mu[i] + torch.randn_like(sigma[i]) * torch.sqrt(sigma[i])) for i in range(3)]))
+
+        KLij = 0.5 * (torch.log(sigma[1] / sigma[0]) + (sigma[0] + torch.square(mu[0] - mu[1])) / sigma[1] - 1)
+        KLji = 0.5 * (torch.log(sigma[0] / sigma[1]) + (sigma[1] + torch.square(mu[1] - mu[0])) / sigma[0] - 1)
+
+        KLil = 0.5 * (torch.log(sigma[2] / sigma[0]) + (sigma[0] + torch.square(mu[0] - mu[2])) / sigma[2] - 1)
+        KLli = 0.5 * (torch.log(sigma[0] / sigma[2]) + (sigma[2] + torch.square(mu[2] - mu[0])) / sigma[0] - 1)
+
+        Dij = -torch.clamp(torch.sum(KLij*0.5 + KLji*0.5, dim = 1), min=-6, max=6)
+        Dil = -torch.clamp(torch.sum(KLil*0.5 + KLli*0.5, dim = 1), min=-6, max=6)
+        D = torch.stack((-Dij, -Dil))
+
+        # expDij = torch.exp(-Dij)
+        pt = torch.exp(-Dij)/(torch.exp(-Dij) + torch.exp(-Dil))
+
+        # pt = self._softmax(D)[0]
+        pt_log = -torch.log(torch.cat((torch.masked_select(pt, ge_differential), (
+                    1.0 - torch.masked_select(pt, torch.logical_not(ge_differential)))))).mean()
+
+        return x_pred, kld, pt_log
 
     def encode(self, x):
         mu, log_sigma = self._encoder(x)
@@ -176,8 +236,3 @@ class VAEAge(nn.Module):
 
     def decode(self, z):
         return self._decoder(z)
-
-    def reg(self):
-        return self._age.reg()
-
-
